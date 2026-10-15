@@ -1,6 +1,7 @@
 # Publishes to npm when a version tag is pushed: `npm version patch && git push --follow-tags`.
-# Needs an NPM_TOKEN repository secret (an npm automation token). Skips versions already on npm,
-# so tagging a release that was published by hand (e.g. via publish.sh) is a no-op.
+# Uses npm trusted publishing (OIDC): no token or secret, the package's npm settings list this
+# repo and workflow as a trusted publisher. Skips versions already on npm, so tagging a release
+# that was published by hand (e.g. via publish.sh) is a no-op.
 name: Release
 
 on:
@@ -36,6 +37,5 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
       - if: steps.published.outputs.already == 'false'
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Trusted publishing needs npm 11.5.1+; Node 22 ships an older npm.
+        run: npm install -g npm@latest && npm publish --provenance --access public
