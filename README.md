@@ -86,7 +86,7 @@ bun run build   # dist/vendor-repo.js
 bun run test:dist  # integration tests against the built bundle under Node
 ```
 
-First release: `bash publish.sh` verifies everything, then asks before creating the GitHub repo, publishing to npm, pushing the tag, and storing the `NPM_TOKEN` secret. Later releases: `npm version patch && git push --follow-tags`.
+First release: `bash publish.sh` verifies everything, then asks before creating the GitHub repo, publishing to npm, and pushing the tag. Later releases: `npm version patch && git push --follow-tags`, published from CI through npm trusted publishing (configure it once under the package's Settings on npmjs.com; no token needed).
 
 ## License
 

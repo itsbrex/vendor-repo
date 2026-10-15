@@ -100,9 +100,13 @@ if ! git rev-parse "v$VERSION" >/dev/null 2>&1; then git tag "v$VERSION"; fi
 if git remote get-url origin >/dev/null 2>&1 && confirm "Push tag v$VERSION? (release.yml skips versions already on npm)"; then
   git push origin "v$VERSION"
 fi
-if git remote get-url origin >/dev/null 2>&1 && confirm "Store an npm automation token as the NPM_TOKEN secret so future tags publish from CI?"; then
-  gh secret set NPM_TOKEN --repo "$REPO"
-fi
+cat <<EOT
+
+release.yml publishes future tags through npm trusted publishing, so no token is needed.
+Enable it once on npm: https://www.npmjs.com/package/$NAME/access -> Trusted Publisher ->
+GitHub Actions, owner "$OWNER", repository "vendor-repo", workflow "release.yml", allow npm publish.
+npm asks for a one-time password, then wants one CI publish within 48 hours to validate it.
+EOT
 
 echo
 echo "Done. Next releases: npm version patch && git push --follow-tags"
