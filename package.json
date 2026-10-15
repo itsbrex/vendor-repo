@@ -1,0 +1,42 @@
+{
+  "name": "vendor-repo",
+  "version": "0.1.0",
+  "description": "Vendor dependency source as squashed git subtrees under repos/, pinned to the installed version, so coding agents read real library code.",
+  "type": "module",
+  "bin": {
+    "vendor-repo": "dist/vendor-repo.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "bun build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build",
+    "test:dist": "bun run build && VENDOR_REPO_BIN=dist/vendor-repo.js bun test vendor-repo.integration.test.ts"
+  },
+  "keywords": [
+    "git-subtree",
+    "vendor",
+    "coding-agents",
+    "claude-code",
+    "agents-md",
+    "monorepo"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itsbrex/vendor-repo.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
