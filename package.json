@@ -1,6 +1,6 @@
 {
   "name": "vendor-repo",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Vendor dependency source as squashed git subtrees under repos/, pinned to the installed version, so coding agents read real library code.",
   "type": "module",
   "bin": {
