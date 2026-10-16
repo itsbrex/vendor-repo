@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  editJsonText,
+  editLibrariesSection,
+  insertSectionLineText,
+  planDoctorFix,
   compareVersions,
   goModuleRepo,
   normalizeGoVersion,
@@ -266,5 +270,60 @@ describe("doctor helpers", () => {
     expect(tomlSection(text, "workspace")).toContain("exclude");
     expect(tomlSection(text, "workspace")).not.toContain("serde");
     expect(tomlSection(text, "package")).toBeUndefined();
+  });
+});
+
+describe("init helpers", () => {
+  test("editJsonText keeps the file's indent and refuses JSONC", () => {
+    const tabbed = editJsonText('{\n\t"a": 1\n}\n', (data) => {
+      data.b = [2];
+      return true;
+    });
+    expect(tabbed).toBe('{\n\t"a": 1,\n\t"b": [\n\t\t2\n\t]\n}\n');
+    expect(editJsonText(undefined, (data) => {
+      data.a = 1;
+      return true;
+    })).toBe('{\n  "a": 1\n}\n');
+    expect(editJsonText('{ // comment\n "a": 1 }', () => true)).toBeUndefined();
+    expect(editJsonText("[1]", () => true)).toBeUndefined();
+    expect(editJsonText("{}", () => false)).toBeUndefined();
+  });
+
+  test("insertSectionLineText adds after the header, appends a missing section, and leaves an existing key alone", () => {
+    expect(insertSectionLineText("[a]\nx = 1\n\n[b]\ny = 2\n", "b", "z", "z = 3")).toBe("[a]\nx = 1\n\n[b]\nz = 3\ny = 2\n");
+    expect(insertSectionLineText("[a]\nx = 1\n", "test", "k", 'k = ["v"]')).toBe('[a]\nx = 1\n\n[test]\nk = ["v"]\n');
+    expect(insertSectionLineText(undefined, "test", "k", "k = 1")).toBe("[test]\nk = 1\n");
+    expect(insertSectionLineText("[b]\nz = 0\n", "b", "z", "z = 3")).toBeUndefined();
+  });
+
+  test("editLibrariesSection edits only the Libraries list and restores the placeholder when it empties", () => {
+    const doc = "# App\n\n## Vendored Repositories\n\nIntro.\n\n### Libraries\n\n- **a**: see `repos/a/`\n\n### Pattern files\n\n- `agent-patterns/x.md`\n";
+    const added = editLibrariesSection(doc, (bullets) => [...bullets, "- **b**: see `repos/b/`"]);
+    expect(added).toBe("# App\n\n## Vendored Repositories\n\nIntro.\n\n### Libraries\n\n- **a**: see `repos/a/`\n- **b**: see `repos/b/`\n\n### Pattern files\n\n- `agent-patterns/x.md`\n");
+    const emptied = editLibrariesSection(doc, () => []);
+    expect(emptied).toContain("### Libraries\n\n- (none yet");
+    expect(emptied).toContain("### Pattern files\n\n- `agent-patterns/x.md`\n");
+    expect(editLibrariesSection(doc, (bullets) => bullets)).toBeUndefined();
+    expect(editLibrariesSection("# App\n\n### Libraries\n", (bullets) => [...bullets, "- x"])).toBeUndefined(); // no Vendored Repositories section
+    expect(editLibrariesSection("## Vendored Repositories\n\ntext\n", (bullets) => [...bullets, "- x"])).toBeUndefined(); // no Libraries list
+  });
+
+  test("planDoctorFix leaves JavaScript configs and workspace globs to a human", () => {
+    const current = (): string | undefined => undefined;
+    const plan = (id: string, file: string, status: "missing" | "warn" = "missing") => planDoctorFix("/project", { id, tool: id, status, file, message: "" }, current);
+    expect(plan("eslint", "eslint.config.js")).toBeUndefined();
+    expect(plan("eslint", ".eslintrc.json")).toEqual({ file: ".eslintignore", content: "repos/\n" });
+    expect(plan("vitest", "vitest.config.ts")).toBeUndefined();
+    expect(plan("workspaces", "package.json", "warn")).toBeUndefined();
+    expect(plan("knip", "knip.config.ts")).toBeUndefined();
+    expect(plan("knip", "knip.json")?.content).toContain('"!repos/**"');
+    expect(plan("ruff", ".ruff.toml")).toEqual({ file: ".ruff.toml", content: 'extend-exclude = ["repos"]\n' });
+    expect(plan("pytest", "pytest.ini")?.content).toBe("[pytest]\nnorecursedirs = *.egg .* _darcs build CVS dist node_modules venv {arch} repos\n");
+  });
+
+  test("planDoctorFix puts the Tailwind @source line next to the import, relative to the stylesheet", () => {
+    const current = (file: string): string | undefined => (file === "src/styles/app.css" ? '@import "tailwindcss";\n\nbody {}\n' : undefined);
+    const fix = planDoctorFix("/project", { id: "tailwind", tool: "Tailwind CSS", status: "missing", file: "src/styles/app.css", message: "" }, current);
+    expect(fix?.content).toBe('@import "tailwindcss";\n@source not "../../repos";\n\nbody {}\n');
   });
 });

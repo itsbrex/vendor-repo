@@ -12,6 +12,7 @@ npx vendor-repo add effect
 ## Commands
 
 ```bash
+vendor-repo init [--ci|--no-ci] [--dry-run] [--json]
 vendor-repo add <package> [--ecosystem npm|pypi|go|cargo] [--ref <tag|branch|sha>] [--name <dir>] [--latest] [--dry-run]
 vendor-repo add <name> --url <git-url> --ref <tag|branch|sha>
 vendor-repo update <name> [--ref <tag|branch|sha>] [--latest] [--dry-run]
@@ -22,9 +23,10 @@ vendor-repo check [--hook]
 vendor-repo doctor [--json]
 ```
 
-- **`add`** finds the installed version, resolves the upstream repo, matches the version to a git tag, runs `git subtree add --squash`, and records everything in `repos/vendored.json`. It lands as two commits.
+- **`init`** sets a project up in one commit: an empty `repos/vendored.json`, a "Vendored Repositories" section (with a "### Libraries" list) in `CLAUDE.md` / `AGENTS.md`, every tooling exclude it can write safely (text, JSON, and TOML files), and `.github/workflows/vendored-repos.yml` when the project is on GitHub. Fixes that live in JavaScript configs (flat ESLint, Vitest, Jest, Knip) or need judgment (workspace globs) are printed as `manual` lines instead. It never reformats JSONC. Re-running it is a no-op.
+- **`add`** finds the installed version, resolves the upstream repo, matches the version to a git tag, runs `git subtree add --squash`, and records everything in `repos/vendored.json`. When `CLAUDE.md` / `AGENTS.md` has the "### Libraries" list, it adds the repo's line there too. It lands as two commits.
 - **`update`** re-pins to the newly installed version after a dependency bump. `--all` does this for every drifted repo, and stops if a subtree pull leaves conflicts.
-- **`remove`** deletes the subtree and its manifest entry in one commit. It asks first unless you pass `--yes`, and the code stays in git history.
+- **`remove`** deletes the subtree, its manifest entry, and its "### Libraries" line in one commit. It asks first unless you pass `--yes`, and the code stays in git history.
 - **`list --json`** prints each vendored repo with its manifest fields, status, and installed version, for scripts and agents.
 - **`check`** exits 1 when a vendored repo no longer matches the installed version. It emits annotations in GitHub Actions. With `--hook` it emits Claude Code SessionStart JSON and always exits 0.
 
@@ -61,6 +63,8 @@ Add to `~/.claude/settings.json` to get a vendored-repo summary at session start
 ```
 
 ## CI
+
+`vendor-repo init` writes `.github/workflows/vendored-repos.yml`, which runs on pull requests that touch `repos/` or a lockfile. The core of it:
 
 ```yaml
 - uses: actions/checkout@v4

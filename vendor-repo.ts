@@ -4,6 +4,7 @@
  * so coding agents can read real library source instead of guessing.
  *
  * Usage:
+ *   vendor-repo init [--ci|--no-ci] [--dry-run] [--json]
  *   vendor-repo add <package> [--ecosystem npm|pypi|go|cargo] [--ref <tag|branch|sha>] [--name <dir>] [--latest] [--dry-run]
  *   vendor-repo add <name> --url <git-url> --ref <tag|branch|sha> [--dry-run]
  *   vendor-repo update <name> [--ref <tag|branch|sha>] [--latest] [--dry-run]
@@ -13,11 +14,15 @@
  *   vendor-repo check [--hook]
  *   vendor-repo doctor [--json]
  *
+ * `init` sets a project up in one commit: an empty `repos/vendored.json`, a "Vendored Repositories"
+ * section in CLAUDE.md / AGENTS.md, every tooling exclude `doctor` can write itself (the rest is
+ * printed), and the GitHub Actions drift check when the project is on GitHub.
+ *
  * `add` finds the installed version of a package (npm, PyPI, Go modules, or Cargo), resolves the
  * upstream repo, matches the version to a git tag, runs `git subtree add --squash`, and records the
- * result in `repos/vendored.json`.
+ * result in `repos/vendored.json` and under "### Libraries" in CLAUDE.md / AGENTS.md when that list exists.
  *
- * `remove` deletes a vendored repo and its manifest entry in one commit (asks first unless `--yes`).
+ * `remove` deletes a vendored repo, its manifest entry, and its Libraries line in one commit (asks first unless `--yes`).
  * `list --json` prints manifest entries with their current status for scripts and agents.
  * `update --all` re-pins every drifted repo. `doctor` checks that repos/ is excluded from the project's tooling.
  *
@@ -27,8 +32,8 @@
  * Runs with Bun (`bun vendor-repo.ts …`) or Node 22.6+ (`node --experimental-strip-types vendor-repo.ts …`).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -581,8 +586,8 @@ function isPinned(pkg: string | undefined, resolved: ResolvedVersion | undefined
   return resolved.pseudoCommit !== undefined && options.ref.startsWith(resolved.pseudoCommit);
 }
 
-function commitManifest(root: string, message: string): void {
-  git(["add", join(REPOS_DIR, MANIFEST_FILE)], root);
+function commitManifest(root: string, message: string, extraFiles: string[] = []): void {
+  git(["add", "--", join(REPOS_DIR, MANIFEST_FILE), ...extraFiles], root);
   git(["commit", "-m", message], root);
 }
 
@@ -631,11 +636,13 @@ async function addCommand(target: string, options: CommandOptions): Promise<void
     vendoredAt: today(),
   };
   writeManifest(root, manifest);
-  commitManifest(root, `📌 chore(repos): record ${prefix} in ${MANIFEST_FILE}`);
+  const source = directory ? `${prefix}/${directory}/` : `${prefix}/`;
+  const line = libraryLine(pkg ?? name, source);
+  const agentFiles = recordLibrary(root, name, line);
+  commitManifest(root, `📌 chore(repos): record ${prefix} in ${MANIFEST_FILE}`, agentFiles);
 
-  const source = directory ? `repos/${name}/${directory}/` : `repos/${name}/`;
-  console.log(`\nDone. Suggested line for the project's CLAUDE.md / AGENTS.md:\n`);
-  console.log(`- When writing code that uses \`${pkg ?? name}\`, inspect \`${source}\` for idiomatic usage, tests, and API design. Treat it as the source of truth for its patterns.`);
+  if (agentFiles.length > 0) console.log(`\nDone. Added ${prefix} under "${LIBRARIES_HEADING}" in ${agentFiles.join(" and ")}.`);
+  else console.log(`\nDone. Suggested line for the project's CLAUDE.md / AGENTS.md (\`vendor-repo init\` adds the section):\n\n${line}`);
 }
 
 async function updateCommand(rawName: string, options: CommandOptions, root = repoRoot(process.cwd())): Promise<void> {
@@ -902,10 +909,16 @@ async function removeCommand(rawName: string, yes: boolean): Promise<void> {
   if (manifest.repos[name]) {
     delete manifest.repos[name];
     writeManifest(root, manifest);
-    git(["add", join(REPOS_DIR, MANIFEST_FILE)], root);
+    git(["add", "--", join(REPOS_DIR, MANIFEST_FILE)], root);
   }
+  const agentFiles = recordLibrary(root, name, undefined);
+  if (agentFiles.length > 0) git(["add", "--", ...agentFiles], root);
   git(["commit", "-q", "-m", `🔥 chore(repos): remove ${prefix}`], root);
-  console.log(`Removed ${prefix}. Remember to drop its line from the project's CLAUDE.md / AGENTS.md.`);
+  console.log(
+    agentFiles.length > 0
+      ? `Removed ${prefix} and its line from ${agentFiles.join(" and ")}.`
+      : `Removed ${prefix}. Remember to drop its line from the project's CLAUDE.md / AGENTS.md.`,
+  );
 }
 
 type ListEntry = Partial<VendoredRepo> & {
@@ -1316,13 +1329,14 @@ export function doctorChecks(root: string): DoctorCheck[] {
       ...(ok ? {} : { fix: 'norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "repos"]' }),
     });
   }
-  const ruff = pySection("tool.ruff") ?? readText(join(root, "ruff.toml")) ?? readText(join(root, ".ruff.toml"));
+  const ruffFile = firstExisting(root, ["ruff.toml", ".ruff.toml"]);
+  const ruff = pySection("tool.ruff") ?? (ruffFile ? readText(join(root, ruffFile)) : undefined);
   if (ruff !== undefined) {
     const ok = /exclude[^\n]*repos/.test(ruff);
     add({
       id: "ruff",
       tool: "Ruff",
-      file: pySection("tool.ruff") !== undefined ? "pyproject.toml" : "ruff.toml",
+      file: pySection("tool.ruff") !== undefined ? "pyproject.toml" : (ruffFile ?? "ruff.toml"),
       status: ok ? "ok" : "missing",
       message: ok ? "repos excluded" : "repos/ will be linted and formatted",
       ...(ok ? {} : { fix: 'extend-exclude = ["repos"]' }),
@@ -1375,9 +1389,346 @@ function doctorCommand(json: boolean): void {
   if (checks.some((c) => c.status === "missing")) process.exitCode = 1;
 }
 
+// ---------- init ----------
+
+const AGENT_FILES = ["CLAUDE.md", "AGENTS.md"];
+const AGENT_SECTION_HEADING = "## Vendored Repositories";
+const LIBRARIES_HEADING = "### Libraries";
+const LIBRARIES_PLACEHOLDER = "- (none yet – `vendor-repo add <package>` adds a line here)";
+
+// Written into the project's CLAUDE.md / AGENTS.md by `init`. `@repos/` is Claude Code import syntax on purpose.
+const AGENT_SECTION = `${AGENT_SECTION_HEADING}
+
+This project vendors external repositories under @repos/ as squashed git subtrees. @repos/vendored.json records each repo's upstream URL, ref, and the package version it matches.
+
+- Use vendored repositories as read-only reference material when working with related libraries
+- Prefer examples and patterns from the vendored source code over generated guesses or web search results
+- Do not edit files under @repos/ unless explicitly asked
+- Do not import from @repos/ – application code should continue importing from normal package dependencies
+- When searching application code, scope searches to the app's source directories so results from @repos/ don't crowd them out
+- If a vendored repo's version in @repos/vendored.json differs from the installed package, trust the installed package's types and say so
+- To add, update, or remove a vendored repo, suggest \`vendor-repo add <package>\`, \`vendor-repo update <name>\`, or \`vendor-repo remove <name>\` and wait for approval
+- Run \`vendor-repo list --json\` to see what's vendored and whether it matches the installed versions, and \`vendor-repo doctor\` to check \`repos/\` is still excluded from the project's tooling
+
+${LIBRARIES_HEADING}
+
+${LIBRARIES_PLACEHOLDER}
+`;
+
+const CI_WORKFLOW_FILE = ".github/workflows/vendored-repos.yml";
+
+const CI_WORKFLOW = `# Fails a PR when a dependency bump leaves a vendored repo pinned to the old version.
+# No install step is needed: the check reads lockfiles (package-lock, bun.lock, pnpm-lock, yarn.lock,
+# uv/poetry/pdm.lock, requirements*.txt, go.mod, Cargo.lock) directly. Written by \`vendor-repo init\`.
+name: Vendored repos
+
+on:
+  pull_request:
+    paths:
+      - "repos/**"
+      - "package.json"
+      - "package-lock.json"
+      - "npm-shrinkwrap.json"
+      - "bun.lock"
+      - "pnpm-lock.yaml"
+      - "yarn.lock"
+      - "uv.lock"
+      - "poetry.lock"
+      - "pdm.lock"
+      - "requirements*.txt"
+      - "go.mod"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    # Uncomment to report drift as annotations without failing the PR.
+    # continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Check vendored repos against installed versions
+        run: bunx vendor-repo@0 check
+      - name: Check repos/ is excluded from tooling (advisory)
+        continue-on-error: true
+        run: bunx vendor-repo@0 doctor
+`;
+
+const RENOVATE_DEFAULT_IGNORE = ["**/node_modules/**", "**/bower_components/**", "**/vendor/**", "**/examples/**", "**/__tests__/**", "**/test/**", "**/tests/**", "**/__fixtures__/**"];
+const KNIP_DEFAULT_PROJECT = ["**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}"];
+const PYRIGHT_DEFAULT_EXCLUDE = ["**/node_modules", "**/__pycache__", "**/.*"];
+
+type JsonObject = Record<string, unknown>;
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]) : undefined;
+}
+
+function withEntry(list: string[] | undefined, fallback: string[], entry: string): string[] {
+  const base = list ?? fallback;
+  return base.includes(entry) ? base : [...base, entry];
+}
+
+export function detectIndent(text: string): string {
+  return text.match(/^( +|\t)\S/m)?.[1] ?? "  ";
+}
+
+/** Applies `mutate` to a strict-JSON document and re-serializes it with the file's indent. Comments or trailing commas can't be kept, so JSONC returns undefined. */
+export function editJsonText(text: string | undefined, mutate: (data: JsonObject) => boolean | undefined): string | undefined {
+  let data: unknown;
+  try {
+    data = JSON.parse(text ?? "{}");
+  } catch {
+    return undefined;
+  }
+  if (!isObject(data)) return undefined;
+  if (mutate(data) === false) return undefined;
+  return `${JSON.stringify(data, null, detectIndent(text ?? ""))}\n`;
+}
+
+export function appendLineText(text: string | undefined, line: string): string {
+  const current = text ?? "";
+  const separator = current === "" || current.endsWith("\n") ? "" : "\n";
+  return `${current}${separator}${line}\n`;
+}
+
+/** Inserts `line` right after a TOML/INI `[header]`, or appends the section. Returns undefined when the section already sets `key`. */
+export function insertSectionLineText(text: string | undefined, header: string, key: string, line: string): string | undefined {
+  const current = text ?? "";
+  const section = tomlSection(current, header);
+  if (section === undefined) return appendLineText(current, `${current.trim() === "" ? "" : "\n"}[${header}]\n${line}`);
+  if (new RegExp(`^\\s*${escapeRegex(key)}\\s*=`, "m").test(section)) return undefined;
+  const match = current.match(new RegExp(`^\\[${escapeRegex(header)}\\][ \\t]*$`, "m"));
+  if (match?.index === undefined) return undefined;
+  const at = match.index + match[0].length;
+  return `${current.slice(0, at)}\n${line}${current.slice(at)}`;
+}
+
+type FileWrite = { file: string; content: string };
+
+/** Turns a doctor finding into the file content that fixes it, or undefined when the fix needs a human (JS configs, JSONC, workspace globs). */
+export function planDoctorFix(root: string, check: DoctorCheck, current: (file: string) => string | undefined): FileWrite | undefined {
+  const file = check.file;
+  const text = current(file);
+  const write = (content: string | undefined, target = file): FileWrite | undefined => (content === undefined ? undefined : { file: target, content });
+  switch (check.id) {
+    case "gitignore":
+      return write((text ?? "").split("\n").filter((line) => !/^\/?repos(\/(\*\*?)?)?\s*$/.test(line.trim())).join("\n"));
+    case "tsconfig":
+      return write(editJsonText(text, (data) => {
+        data.exclude = withEntry(stringArray(data.exclude), ["node_modules"], "repos");
+        return true;
+      }));
+    case "eslint":
+      // Flat configs are JavaScript. Legacy configs read .eslintignore.
+      return file.startsWith(".eslintrc") ? write(appendLineText(current(".eslintignore"), "repos/"), ".eslintignore") : undefined;
+    case "biome":
+      return write(editJsonText(text, (data) => {
+        const files = isObject(data.files) ? data.files : {};
+        files.includes = withEntry(stringArray(files.includes), ["**"], "!!**/repos");
+        data.files = files;
+        return true;
+      }));
+    case "prettier":
+      return write(appendLineText(text, "/repos/"));
+    case "jest":
+      if (file !== "package.json") return undefined;
+      return write(editJsonText(text, (data) => {
+        const jest = isObject(data.jest) ? data.jest : {};
+        jest.testPathIgnorePatterns = withEntry(stringArray(jest.testPathIgnorePatterns), ["/node_modules/"], "<rootDir>/repos/");
+        jest.modulePathIgnorePatterns = withEntry(stringArray(jest.modulePathIgnorePatterns), [], "<rootDir>/repos/");
+        data.jest = jest;
+        return true;
+      }));
+    case "bun-test":
+      return write(insertSectionLineText(text, "test", "pathIgnorePatterns", 'pathIgnorePatterns = ["repos/**"]'));
+    case "tailwind": {
+      if (text === undefined) return undefined;
+      const rel = relative(dirname(join(root, file)), join(root, REPOS_DIR)).split(sep).join("/");
+      const source = `@source not "${rel.startsWith(".") ? rel : `./${rel}`}";`;
+      const updated = text.replace(/^([ \t]*@import\s+["']tailwindcss["'][^\n]*;)/m, `$1\n${source}`);
+      return updated === text ? undefined : write(updated);
+    }
+    case "renovate":
+      return write(editJsonText(text, (data) => {
+        const target = file === "package.json" ? (isObject(data.renovate) ? data.renovate : {}) : data;
+        target.ignorePaths = withEntry(stringArray(target.ignorePaths), RENOVATE_DEFAULT_IGNORE, "repos/**");
+        if (file === "package.json") data.renovate = target;
+        return true;
+      }));
+    case "knip":
+      if (!/\.jsonc?$/.test(file) && file !== "package.json") return undefined;
+      return write(editJsonText(text, (data) => {
+        const target = file === "package.json" ? (isObject(data.knip) ? data.knip : {}) : data;
+        target.project = withEntry(stringArray(target.project), KNIP_DEFAULT_PROJECT, "!repos/**");
+        if (file === "package.json") data.knip = target;
+        return true;
+      }));
+    case "vscode":
+      return write(editJsonText(text, (data) => {
+        for (const key of ["search.exclude", "files.watcherExclude"]) {
+          data[key] = { ...(isObject(data[key]) ? data[key] : {}), "repos/**": true };
+        }
+        data["js/ts.preferences.autoImportFileExcludePatterns"] = withEntry(stringArray(data["js/ts.preferences.autoImportFileExcludePatterns"]), [], "repos/**");
+        return true;
+      }));
+    case "gitattributes":
+      return write(appendLineText(text, "repos/** linguist-vendored linguist-generated"));
+    case "go":
+      return write("module vendored-repos\n");
+    case "cargo":
+      return write(insertSectionLineText(text, "workspace", "exclude", 'exclude = ["repos"]'));
+    case "pytest":
+      return file === "pyproject.toml"
+        ? write(insertSectionLineText(text, "tool.pytest.ini_options", "norecursedirs", 'norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "repos"]'))
+        : write(insertSectionLineText(text, "pytest", "norecursedirs", "norecursedirs = *.egg .* _darcs build CVS dist node_modules venv {arch} repos"));
+    case "ruff":
+      if (file === "pyproject.toml") return write(insertSectionLineText(text, "tool.ruff", "extend-exclude", 'extend-exclude = ["repos"]'));
+      // ruff.toml keys are top-level, so they have to come before any [table].
+      return /^\s*extend-exclude\s*=/m.test(text ?? "") ? undefined : write(`extend-exclude = ["repos"]\n${text ?? ""}`);
+    case "mypy":
+      return file === "pyproject.toml"
+        ? write(insertSectionLineText(text, "tool.mypy", "exclude", 'exclude = ["^repos/"]'))
+        : write(insertSectionLineText(text, "mypy", "exclude", "exclude = ^repos/"));
+    case "pyright":
+      if (file === "pyproject.toml") return write(insertSectionLineText(text, "tool.pyright", "exclude", 'exclude = ["**/node_modules", "**/__pycache__", "**/.*", "repos"]'));
+      return write(editJsonText(text, (data) => {
+        data.exclude = withEntry(stringArray(data.exclude), PYRIGHT_DEFAULT_EXCLUDE, "repos");
+        return true;
+      }));
+    default:
+      return undefined; // workspaces, flat ESLint, Vitest, Jest/Knip/Tailwind in code: print the fix instead
+  }
+}
+
+/** Rewrites the bullet list under "### Libraries" (inside the Vendored Repositories section). Returns undefined when the file has no such section or nothing changed. */
+export function editLibrariesSection(text: string, edit: (bullets: string[]) => string[]): string | undefined {
+  if (!new RegExp(`^${escapeRegex(AGENT_SECTION_HEADING)}\\s*$`, "m").test(text)) return undefined;
+  const lines = text.split("\n");
+  const heading = lines.findIndex((line) => new RegExp(`^${escapeRegex(LIBRARIES_HEADING)}\\s*$`).test(line));
+  if (heading === -1) return undefined;
+  // The list runs to the next heading. Keep a trailing blank line out of it so insertions land on the list.
+  let end = heading + 1;
+  while (end < lines.length && !/^#/.test(lines[end] ?? "")) end++;
+  while (end > heading + 1 && (lines[end - 1] ?? "").trim() === "") end--;
+  const block = lines.slice(heading + 1, end);
+  const bullets = block.filter((line) => line.trim() !== "");
+  const edited = edit(bullets);
+  if (edited.join("\n") === bullets.join("\n")) return undefined;
+  return [...lines.slice(0, heading + 1), "", ...(edited.length > 0 ? edited : [LIBRARIES_PLACEHOLDER]), ...lines.slice(end)].join("\n");
+}
+
+function libraryLine(pkg: string, source: string): string {
+  return `- **${pkg}**: When writing code that uses \`${pkg}\`, inspect \`${source}\` for idiomatic usage, tests, and API design. Treat it as the source of truth for its patterns.`;
+}
+
+/** Adds (or drops) a repo's line in every CLAUDE.md / AGENTS.md that has a Libraries list. Returns the files it changed. */
+function recordLibrary(root: string, name: string, line: string | undefined): string[] {
+  const changed: string[] = [];
+  const marker = `\`${REPOS_DIR}/${name}/`;
+  for (const file of AGENT_FILES) {
+    const text = readText(join(root, file));
+    if (text === undefined) continue;
+    const updated = editLibrariesSection(text, (bullets) => {
+      const kept = bullets.filter((bullet) => !bullet.includes(marker) && !bullet.startsWith(LIBRARIES_PLACEHOLDER));
+      return line ? [...kept, line] : kept;
+    });
+    if (updated === undefined) continue;
+    writeFileSync(join(root, file), updated);
+    changed.push(file);
+  }
+  return changed;
+}
+
+type InitOptions = { dryRun: boolean; json: boolean; ci?: boolean };
+
+type InitAction = { kind: "created" | "updated" | "manual" | "skipped"; file: string; detail: string; fix?: string };
+
+function onGitHub(root: string): boolean {
+  if (existsSync(join(root, ".github"))) return true;
+  try {
+    return /github\.com/i.test(git(["remote", "get-url", "origin"], root));
+  } catch {
+    return false;
+  }
+}
+
+function initCommand(options: InitOptions): void {
+  const root = repoRoot(process.cwd());
+  if (!options.dryRun) assertCleanTree(root);
+
+  const writes = new Map<string, string>();
+  const actions: InitAction[] = [];
+  const current = (file: string): string | undefined => writes.get(file) ?? readText(join(root, file));
+  const plan = (file: string, content: string, detail: string): void => {
+    actions.push({ kind: existsSync(join(root, file)) ? "updated" : "created", file, detail });
+    writes.set(file, content);
+  };
+
+  const manifestFile = `${REPOS_DIR}/${MANIFEST_FILE}`;
+  if (existsSync(join(root, manifestFile))) readManifest(root); // fail early on a corrupt manifest
+  else plan(manifestFile, `${JSON.stringify({ version: 1, repos: {} }, null, 2)}\n`, "empty manifest");
+
+  const existingAgentFiles = AGENT_FILES.filter((file) => existsSync(join(root, file)));
+  for (const file of existingAgentFiles.length > 0 ? existingAgentFiles : [AGENT_FILES[0] ?? "CLAUDE.md"]) {
+    const text = current(file);
+    if (text !== undefined && new RegExp(`^${escapeRegex(AGENT_SECTION_HEADING)}\\s*$`, "m").test(text)) continue;
+    plan(file, text === undefined ? AGENT_SECTION : `${text.trimEnd()}\n\n${AGENT_SECTION}`, "Vendored Repositories section for agents");
+  }
+
+  for (const check of doctorChecks(root)) {
+    if (check.status === "ok") continue;
+    const fix = planDoctorFix(root, check, current);
+    if (fix) plan(fix.file, fix.content, `${check.tool}: ${check.message}`);
+    else actions.push({ kind: "manual", file: check.file, detail: `${check.tool}: ${check.message}`, ...(check.fix ? { fix: check.fix } : {}) });
+  }
+
+  if (options.ci !== false && !existsSync(join(root, CI_WORKFLOW_FILE))) {
+    if (options.ci === true || onGitHub(root)) plan(CI_WORKFLOW_FILE, CI_WORKFLOW, "GitHub Actions drift check");
+    else actions.push({ kind: "skipped", file: CI_WORKFLOW_FILE, detail: "no GitHub remote or .github/ directory; pass --ci to add it anyway" });
+  }
+
+  let commit: string | undefined;
+  if (!options.dryRun && writes.size > 0) {
+    for (const [file, content] of writes) {
+      mkdirSync(dirname(join(root, file)), { recursive: true });
+      writeFileSync(join(root, file), content);
+    }
+    git(["add", "--", ...writes.keys()], root);
+    git(["commit", "-q", "-m", "🔧 chore(repos): set up vendored repos"], root);
+    commit = git(["rev-parse", "HEAD"], root);
+  }
+
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ root, dryRun: options.dryRun, ...(commit ? { commit } : {}), actions }, null, 2)}\n`);
+    return;
+  }
+  if (actions.length === 0) {
+    console.log("Already set up: manifest, agent instructions, tooling excludes, and CI are all in place.");
+    return;
+  }
+  for (const action of actions) {
+    console.log(`${action.kind.padEnd(8)} ${action.file.padEnd(36)} ${action.detail}`);
+    if (action.fix) console.log(`         fix: ${action.fix.replace(/\n/g, "\n              ")}`);
+  }
+  const manual = actions.filter((action) => action.kind === "manual").length;
+  if (options.dryRun) console.log(`\nDry run: ${writes.size} file(s) would be written${manual > 0 ? `, ${manual} fix(es) need a hand edit` : ""}.`);
+  else if (writes.size > 0) console.log(`\nCommitted ${writes.size} file(s) as ${commit?.slice(0, 12)}.${manual > 0 ? ` ${manual} fix(es) need a hand edit; re-run \`vendor-repo doctor\` afterwards.` : ""}`);
+  else console.log(`\nNothing to write. ${manual} fix(es) need a hand edit; re-run \`vendor-repo doctor\` afterwards.`);
+}
+
 // ---------- entry ----------
 
 const USAGE = `Usage:
+  vendor-repo init [--ci|--no-ci] [--dry-run] [--json]
   vendor-repo add <package> [--ecosystem npm|pypi|go|cargo] [--ref <tag|branch|sha>] [--name <dir>] [--latest] [--dry-run]
   vendor-repo add <name> --url <git-url> --ref <tag|branch|sha> [--dry-run]
   vendor-repo update <name> [--ref <tag|branch|sha>] [--latest] [--dry-run]
@@ -1407,6 +1758,8 @@ function parseCli() {
         hook: { type: "boolean", default: false },
         json: { type: "boolean", default: false },
         all: { type: "boolean", default: false },
+        ci: { type: "boolean", default: false },
+        "no-ci": { type: "boolean", default: false },
         yes: { type: "boolean", short: "y", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
@@ -1434,6 +1787,10 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "check") return checkCommand(values.hook ?? false);
+  if (command === "init") {
+    if (values.ci && values["no-ci"]) throw new CliError("Pass either --ci or --no-ci, not both.");
+    return initCommand({ dryRun: options.dryRun, json: values.json ?? false, ...(values.ci ? { ci: true } : values["no-ci"] ? { ci: false } : {}) });
+  }
   if (command === "list") return listCommand(values.json ?? false);
   if (command === "doctor") return doctorCommand(values.json ?? false);
   if (command === "update" && options.url) {

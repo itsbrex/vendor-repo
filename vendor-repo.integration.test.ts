@@ -318,3 +318,124 @@ describe("doctor", () => {
     expect(status).toBe(0);
   });
 });
+
+describe("init", () => {
+  let dir = "";
+  type Action = { kind: string; file: string; detail: string; fix?: string };
+  const init = (...args: string[]): { status: number | null; actions: Action[]; commit?: string } => {
+    const result = run(["init", "--json", ...args], {}, dir);
+    if (result.status !== 0) throw new Error(result.stderr);
+    return JSON.parse(result.stdout) as { status: number | null; actions: Action[]; commit?: string };
+  };
+  const read = (file: string): string => readFileSync(join(dir, file), "utf8");
+  const doctorStatuses = (): Record<string, string> => {
+    const result = run(["doctor", "--json"], {}, dir);
+    const checks = (JSON.parse(result.stdout) as { checks: { id: string; status: string }[] }).checks;
+    return Object.fromEntries(checks.map((c) => [c.id, c.status]));
+  };
+
+  beforeAll(() => {
+    dir = join(tmp, "init");
+    mkdirSync(join(dir, "node_modules/lib"), { recursive: true });
+    mkdirSync(join(dir, ".github"));
+    sh("git", ["init", "-q", "-b", "main"], dir);
+    writeFileSync(join(dir, "node_modules/lib/package.json"), JSON.stringify({ name: "lib", version: "1.0.0", repository: upstreamUrl }));
+    writeFileSync(join(dir, ".gitignore"), "node_modules\nrepos/\n");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "app", dependencies: { lib: "^1.0.0" }, devDependencies: { prettier: "^3" }, jest: { testEnvironment: "node" } }, null, 2));
+    writeFileSync(join(dir, "tsconfig.json"), '{\n  "compilerOptions": {\n    "strict": true\n  }\n}\n');
+    writeFileSync(join(dir, "biome.json"), '{\n\t"formatter": { "enabled": true }\n}\n');
+    writeFileSync(join(dir, "eslint.config.js"), "export default [{ rules: {} }];\n");
+    writeFileSync(join(dir, "go.mod"), "module example.com/app\n\ngo 1.22\n");
+    writeFileSync(join(dir, "Cargo.toml"), '[package]\nname = "app"\n\n[workspace]\nmembers = ["crates/*"]\n');
+    writeFileSync(join(dir, "pyproject.toml"), '[project]\nname = "app"\n\n[tool.ruff]\nline-length = 100\n\n[tool.mypy]\nstrict = true\n');
+    writeFileSync(join(dir, "CLAUDE.md"), "# App\n\nHouse rules.\n");
+    sh("git", ["add", "-A"], dir);
+    sh("git", ["commit", "-qm", "init"], dir);
+  });
+
+  test("--dry-run plans without touching the tree", () => {
+    const { actions, commit } = init("--dry-run");
+    expect(commit).toBeUndefined();
+    expect(sh("git", ["status", "--porcelain"], dir)).toBe("");
+    expect(actions.find((a) => a.file === "repos/vendored.json")?.kind).toBe("created");
+    expect(actions.find((a) => a.file === "CLAUDE.md")?.kind).toBe("updated");
+    expect(actions.find((a) => a.file === "eslint.config.js")?.kind).toBe("manual");
+  });
+
+  test("writes the manifest, agent section, every safe exclude, and the workflow in one commit", () => {
+    const { actions, commit } = init();
+    expect(commit).toBeDefined();
+    expect(sh("git", ["log", "-1", "--format=%s"], dir)).toBe("🔧 chore(repos): set up vendored repos");
+    expect(sh("git", ["status", "--porcelain"], dir)).toBe("");
+
+    expect(JSON.parse(read("repos/vendored.json"))).toEqual({ version: 1, repos: {} });
+    expect(read("CLAUDE.md")).toStartWith("# App\n\nHouse rules.\n\n## Vendored Repositories\n");
+    expect(read("CLAUDE.md")).toContain("### Libraries\n\n- (none yet");
+    expect(read(".gitignore")).toBe("node_modules\n");
+    expect(JSON.parse(read("tsconfig.json")).exclude).toEqual(["node_modules", "repos"]);
+    expect(read("tsconfig.json")).toContain('\n  "exclude"'); // keeps the file's two-space indent
+    expect(JSON.parse(read("biome.json")).files.includes).toEqual(["**", "!!**/repos"]);
+    expect(read("biome.json")).toContain('\n\t"files"'); // keeps the file's tab indent
+    expect(read(".prettierignore")).toBe("/repos/\n");
+    expect(JSON.parse(read("package.json")).jest).toEqual({ testEnvironment: "node", testPathIgnorePatterns: ["/node_modules/", "<rootDir>/repos/"], modulePathIgnorePatterns: ["<rootDir>/repos/"] });
+    expect(read("repos/go.mod")).toBe("module vendored-repos\n");
+    expect(read("Cargo.toml")).toBe('[package]\nname = "app"\n\n[workspace]\nexclude = ["repos"]\nmembers = ["crates/*"]\n');
+    expect(read("pyproject.toml")).toBe('[project]\nname = "app"\n\n[tool.ruff]\nextend-exclude = ["repos"]\nline-length = 100\n\n[tool.mypy]\nexclude = ["^repos/"]\nstrict = true\n');
+    expect(read(".gitattributes")).toBe("repos/** linguist-vendored linguist-generated\n");
+    expect(read(".github/workflows/vendored-repos.yml")).toContain("bunx vendor-repo@0 check");
+
+    const manual = actions.filter((a) => a.kind === "manual");
+    expect(manual.map((a) => a.file)).toEqual(["eslint.config.js"]);
+    expect(manual[0]?.fix).toContain("ignores");
+    expect(doctorStatuses()).toEqual({ gitignore: "ok", tsconfig: "ok", eslint: "missing", biome: "ok", prettier: "ok", jest: "ok", gitattributes: "ok", go: "ok", cargo: "ok", ruff: "ok", mypy: "ok" });
+  });
+
+  test("is idempotent", () => {
+    const before = sh("git", ["rev-parse", "HEAD"], dir);
+    const { actions, commit } = init();
+    expect(commit).toBeUndefined();
+    expect(actions.map((a) => a.kind)).toEqual(["manual"]);
+    expect(sh("git", ["rev-parse", "HEAD"], dir)).toBe(before);
+  });
+
+  test("add and remove keep the Libraries list in CLAUDE.md", () => {
+    const added = run(["add", "lib"], {}, dir);
+    if (added.status !== 0) throw new Error(`add failed: ${added.stderr}`);
+    expect(added.stdout).toContain('Added repos/upstream under "### Libraries" in CLAUDE.md');
+    const line = "- **lib**: When writing code that uses `lib`, inspect `repos/upstream/` for idiomatic usage, tests, and API design. Treat it as the source of truth for its patterns.";
+    expect(read("CLAUDE.md")).toContain(`### Libraries\n\n${line}\n`);
+    expect(read("CLAUDE.md")).not.toContain("(none yet");
+    expect(sh("git", ["show", "--stat", "--format=%s", "HEAD"], dir)).toContain("CLAUDE.md");
+    expect(sh("git", ["status", "--porcelain"], dir)).toBe("");
+
+    const removed = run(["remove", "upstream", "--yes"], {}, dir);
+    if (removed.status !== 0) throw new Error(`remove failed: ${removed.stderr}`);
+    expect(removed.stdout).toContain("Removed repos/upstream and its line from CLAUDE.md");
+    expect(read("CLAUDE.md")).not.toContain(line);
+    expect(read("CLAUDE.md")).toContain("### Libraries\n\n- (none yet");
+    expect(sh("git", ["status", "--porcelain"], dir)).toBe("");
+  });
+
+  test("--no-ci skips the workflow and --ci forces it", () => {
+    const other = join(tmp, "init-noci");
+    mkdirSync(other);
+    sh("git", ["init", "-q", "-b", "main"], other);
+    writeFileSync(join(other, "README.md"), "x\n");
+    sh("git", ["add", "-A"], other);
+    sh("git", ["commit", "-qm", "init"], other);
+
+    const skipped = run(["init", "--json"], {}, other);
+    expect((JSON.parse(skipped.stdout) as { actions: Action[] }).actions.find((a) => a.file.endsWith("vendored-repos.yml"))?.kind).toBe("skipped");
+    expect(existsSync(join(other, ".github"))).toBe(false);
+    expect(existsSync(join(other, "CLAUDE.md"))).toBe(true); // created when neither CLAUDE.md nor AGENTS.md exists
+
+    const both = run(["init", "--ci", "--no-ci"], {}, other);
+    expect(both.status).toBe(1);
+    expect(both.stderr).toContain("either --ci or --no-ci");
+
+    const forced = run(["init", "--ci"], {}, other);
+    expect(forced.status).toBe(0);
+    expect(existsSync(join(other, ".github/workflows/vendored-repos.yml"))).toBe(true);
+    expect(sh("git", ["status", "--porcelain"], other)).toBe("");
+  });
+});
